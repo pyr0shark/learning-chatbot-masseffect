@@ -6,7 +6,7 @@ Builds vector index from database.txt using rolling window chunking.
 import json
 import tiktoken
 from typing import List, Dict, Any
-from litellm_client import AsyncLiteLLMClient
+from .litellm_client import AsyncLiteLLMClient
 
 
 class Indexer:
@@ -187,6 +187,7 @@ async def main():
     Main function to build index from database.txt
     """
     import asyncio
+    from .litellm_client import AsyncLiteLLMClient
     
     client = AsyncLiteLLMClient()
     indexer = Indexer(client)

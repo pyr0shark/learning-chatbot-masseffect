@@ -5,8 +5,8 @@ Extracts new facts from conversations and checks if they're already in the index
 
 import hashlib
 from typing import List, Dict, Any, Set
-from litellm_client import AsyncLiteLLMClient
-from rag_search import RAGSearch
+from .litellm_client import AsyncLiteLLMClient
+from .rag_search import RAGSearch
 
 
 class FactExtractor:

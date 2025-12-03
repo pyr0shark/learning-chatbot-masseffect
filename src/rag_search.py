@@ -7,7 +7,7 @@ import json
 import numpy as np
 import hnswlib
 from typing import List, Dict, Any, Optional
-from litellm_client import AsyncLiteLLMClient
+from .litellm_client import AsyncLiteLLMClient
 
 
 class RAGSearch:

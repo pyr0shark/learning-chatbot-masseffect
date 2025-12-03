@@ -18,5 +18,5 @@ COPY . .
 EXPOSE 8000
 
 # Run with gunicorn + uvicorn worker
-CMD ["gunicorn", "app:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
+CMD ["gunicorn", "src.app:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
 

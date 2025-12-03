@@ -15,10 +15,18 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from litellm_client import AsyncLiteLLMClient
-from rag_search import RAGSearch
-from fact_extractor import FactExtractor
-from indexer import Indexer
+try:
+    # Relative imports when used as a module
+    from .litellm_client import AsyncLiteLLMClient
+    from .rag_search import RAGSearch
+    from .fact_extractor import FactExtractor
+    from .indexer import Indexer
+except ImportError:
+    # Absolute imports when running as script
+    from src.litellm_client import AsyncLiteLLMClient
+    from src.rag_search import RAGSearch
+    from src.fact_extractor import FactExtractor
+    from src.indexer import Indexer
 
 # Initialize FastAPI app
 app = FastAPI(title="Mass Effect Lore Assistant")
@@ -331,5 +339,14 @@ async def reject_fact(request: RejectFactRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    import sys
+    from pathlib import Path
+    # Add parent directory to path for running as script
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    # Import with absolute path for script execution
+    from src.litellm_client import AsyncLiteLLMClient
+    from src.rag_search import RAGSearch
+    from src.fact_extractor import FactExtractor
+    from src.indexer import Indexer
     uvicorn.run(app, host="0.0.0.0", port=8000)
 

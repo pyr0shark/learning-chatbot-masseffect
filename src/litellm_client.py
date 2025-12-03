@@ -12,7 +12,7 @@ class AsyncLiteLLMClient:
     """
     Async client for LiteLLM API calls.
     
-    Automatically configures environment variables for PwC's OpenAI API endpoint.
+    Automatically configures environment variables for OpenAI API endpoint.
     """
     
     def __init__(
