@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+gunicorn
+pydantic
+litellm
+tiktoken
+hnswlib
+numpy
