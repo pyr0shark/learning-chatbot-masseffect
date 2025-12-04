@@ -4,9 +4,12 @@ Extracts new facts from conversations and checks if they're already in the index
 """
 
 import hashlib
+import logging
 from typing import List, Dict, Any, Set
 from .litellm_client import AsyncLiteLLMClient
 from .rag_search import RAGSearch
+
+logger = logging.getLogger(__name__)
 
 
 class FactExtractor:
@@ -65,6 +68,8 @@ class FactExtractor:
         Returns:
             List of candidate fact strings
         """
+        logger.info(f"[FACT-EXTRACTOR] Extracting candidate facts - History: {len(conversation_history)} messages, Used results: {len(used_search_results)} chunks")
+        
         # Build conversation text
         conversation_text = "\n".join([
             f"{msg['role']}: {msg['content']}" 
@@ -75,6 +80,8 @@ class FactExtractor:
         used_results_text = "\n\n".join([
             chunk["text"] for chunk in used_search_results
         ])
+        
+        logger.debug(f"[FACT-EXTRACTOR] Conversation text length: {len(conversation_text)} chars, Used results text length: {len(used_results_text)} chars")
         
         prompt = f"""You are analyzing a conversation about Mass Effect lore to extract new factual statements that are not already present in the knowledge base.
 
@@ -96,6 +103,7 @@ Output each fact on a separate line. Each fact should be a complete, standalone 
 If no new facts are found, output only "NONE".
 """
         
+        logger.info(f"[FACT-EXTRACTOR] Calling GPT-5-nano to extract candidate facts")
         response = await self.client.text_completion(
             prompt=prompt,
             model_name="azure.gpt-5-nano",
@@ -105,6 +113,10 @@ If no new facts are found, output only "NONE".
         
         # Parse facts
         facts = [line.strip() for line in response.strip().split('\n') if line.strip() and line.strip().upper() != "NONE"]
+        
+        logger.info(f"[FACT-EXTRACTOR] Extracted {len(facts)} candidate facts")
+        for i, fact in enumerate(facts, 1):
+            logger.info(f"[FACT-EXTRACTOR] Candidate fact {i}/{len(facts)}: {fact[:100]}...")
         
         return facts
     
@@ -118,12 +130,18 @@ If no new facts are found, output only "NONE".
         Returns:
             True if fact is already in index, False otherwise
         """
+        logger.info(f"[FACT-EXTRACTOR] Checking index presence for fact: {fact_text[:80]}...")
+        
         # Get top-10 nearest chunks
         nearest_chunks = await self.rag_search.vector_search(fact_text, k=10)
+        logger.info(f"[FACT-EXTRACTOR] Found {len(nearest_chunks)} nearest chunks for fact check")
         
         # Build context from nearest chunks
         chunk_texts = [chunk["text"] for chunk in nearest_chunks]
         context_text = "\n\n".join(chunk_texts)
+        
+        top_similarities = [f"{chunk['similarity']:.4f}" for chunk in nearest_chunks[:3]]
+        logger.debug(f"[FACT-EXTRACTOR] Top chunk similarities: {top_similarities}")
         
         prompt = f"""You are checking if a factual statement is already present in a knowledge base.
 
@@ -138,6 +156,7 @@ Question: Does the information in these knowledge base chunks already contain th
 Answer with only "true" or "false" (lowercase, no punctuation, no explanation).
 """
         
+        logger.debug(f"[FACT-EXTRACTOR] Calling GPT-5-nano to check if fact is already in index")
         response = await self.client.text_completion(
             prompt=prompt,
             model_name="azure.gpt-5-nano",
@@ -147,7 +166,9 @@ Answer with only "true" or "false" (lowercase, no punctuation, no explanation).
         
         # Parse boolean response
         response_lower = response.strip().lower()
-        return response_lower.startswith("true")
+        is_present = response_lower.startswith("true")
+        logger.info(f"[FACT-EXTRACTOR] Index presence check result: {'PRESENT' if is_present else 'NEW'} (response: {response_lower[:20]})")
+        return is_present
     
     async def process_facts(
         self,
@@ -166,35 +187,52 @@ Answer with only "true" or "false" (lowercase, no punctuation, no explanation).
         Returns:
             List of new facts that passed all checks
         """
+        logger.info(f"[FACT-EXTRACTOR] Starting fact processing pipeline (seen_hashes: {len(seen_fact_hashes) if seen_fact_hashes else 0})")
+        
         if seen_fact_hashes is None:
             seen_fact_hashes = set()
         
         # Step 1: Extract candidate facts
+        logger.info(f"[FACT-EXTRACTOR] Step 1: Extracting candidate facts")
         candidate_facts = await self.extract_candidate_facts(
             conversation_history,
             used_search_results
         )
         
         if not candidate_facts:
+            logger.info(f"[FACT-EXTRACTOR] No candidate facts extracted")
             return []
         
         # Step 2: Deduplicate against seen facts
+        logger.info(f"[FACT-EXTRACTOR] Step 2: Deduplicating {len(candidate_facts)} candidate facts against {len(seen_fact_hashes)} seen hashes")
         new_candidates = []
         for fact in candidate_facts:
             fact_hash = self._hash_fact(fact)
             if fact_hash not in seen_fact_hashes:
                 new_candidates.append(fact)
                 seen_fact_hashes.add(fact_hash)
+                logger.debug(f"[FACT-EXTRACTOR] New candidate fact (hash: {fact_hash[:8]}...): {fact[:80]}...")
+            else:
+                logger.debug(f"[FACT-EXTRACTOR] Duplicate fact skipped (hash: {fact_hash[:8]}...): {fact[:80]}...")
+        
+        logger.info(f"[FACT-EXTRACTOR] Step 2: {len(new_candidates)} new candidates after deduplication (removed {len(candidate_facts) - len(new_candidates)} duplicates)")
         
         if not new_candidates:
+            logger.info(f"[FACT-EXTRACTOR] No new candidates after deduplication")
             return []
         
         # Step 3: Check each candidate against index
+        logger.info(f"[FACT-EXTRACTOR] Step 3: Checking {len(new_candidates)} candidates against index")
         new_facts = []
-        for fact in new_candidates:
+        for i, fact in enumerate(new_candidates, 1):
+            logger.info(f"[FACT-EXTRACTOR] Checking candidate {i}/{len(new_candidates)}")
             is_present = await self.check_index_presence(fact)
             if not is_present:
                 new_facts.append(fact)
+                logger.info(f"[FACT-EXTRACTOR] Candidate {i} is NEW - added to final list")
+            else:
+                logger.info(f"[FACT-EXTRACTOR] Candidate {i} is already in index - skipped")
         
+        logger.info(f"[FACT-EXTRACTOR] Fact processing complete: {len(new_facts)} new facts found out of {len(candidate_facts)} candidates")
         return new_facts
 

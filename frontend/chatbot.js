@@ -108,9 +108,15 @@ class Chatbot {
             const data = await response.json();
             return data; // Return full response object
         } catch (error) {
-            // Fallback: gebruik een mock response als de API niet beschikbaar is
-            console.warn('API call failed, using mock response:', error);
-            return this.getMockResponse(message);
+            // Log the actual error for debugging
+            console.error('API call failed:', error);
+            console.error('Error details:', {
+                message: error.message,
+                stack: error.stack,
+                name: error.name
+            });
+            // Don't use mock response - show actual error to user
+            throw error; // Re-throw so the error handler in sendMessage can show it
         }
     }
     
@@ -215,12 +221,12 @@ class Chatbot {
             clearInterval(this.factPollingInterval);
         }
         
-        // Check immediately
+        // Check immediately and then more frequently
         this.checkPendingFacts();
         
-        // Then poll every 2 seconds for 30 seconds
+        // Poll every 500ms for 60 seconds to catch facts as soon as they're found
         let pollCount = 0;
-        const maxPolls = 15; // 15 polls * 2 seconds = 30 seconds
+        const maxPolls = 120; // 120 polls * 500ms = 60 seconds
         
         this.factPollingInterval = setInterval(() => {
             pollCount++;
@@ -230,7 +236,7 @@ class Chatbot {
                 clearInterval(this.factPollingInterval);
                 this.factPollingInterval = null;
             }
-        }, 2000);
+        }, 500);
     }
     
     async checkPendingFacts() {
@@ -361,13 +367,28 @@ class Chatbot {
                 throw new Error('Failed to approve fact');
             }
             
-            // Remove fact message and show confirmation
+            // Get fact text before removing the message
             const factMessage = document.querySelector(`[data-fact-id="${factId}"]`);
+            let factText = '';
             if (factMessage) {
+                const editInput = factMessage.querySelector('.fact-edit-input');
+                const factTextElement = factMessage.querySelector('.fact-text');
+                // Get the current fact text (either from edit input if visible, or from fact text element)
+                if (editInput && editInput.style.display !== 'none') {
+                    factText = editInput.value;
+                } else if (factTextElement) {
+                    // Extract text from the fact text element (remove the "New fact discovered:" prefix)
+                    const textContent = factTextElement.textContent || factTextElement.innerText;
+                    factText = textContent.replace(/^New fact discovered:\s*/i, '').trim();
+                }
                 factMessage.remove();
             }
             
-            this.addMessage('✅ Fact approved and added to index!', 'bot');
+            // Show confirmation with fact text
+            const approvalMessage = factText 
+                ? `✅ Fact approved and added to index!\n\n📝 **Fact:** ${factText}`
+                : '✅ Fact approved and added to index!';
+            this.addMessage(approvalMessage, 'bot');
         } catch (error) {
             console.error('Error approving fact:', error);
             this.addMessage('❌ Error approving fact. Please try again.', 'bot');

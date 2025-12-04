@@ -6,11 +6,21 @@ Main application serving API endpoints and static frontend.
 import os
 import asyncio
 import uuid
+import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from collections import defaultdict
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -30,6 +40,15 @@ except ImportError:
 
 # Initialize FastAPI app
 app = FastAPI(title="Mass Effect Lore Assistant")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Mount static files from frontend directory
 app.mount("/frontend", StaticFiles(directory="frontend"), name="frontend")
@@ -109,37 +128,66 @@ async def startup():
     print("Application started successfully")
 
 
-# Background worker for fact discovery
+# Immediate fact processing function
+async def process_facts_for_session(session_id: str):
+    """Process facts for a session immediately."""
+    global fact_extractor
+    
+    logger.info(f"[FACT-DISCOVERY] Starting fact discovery for session: {session_id}")
+    
+    if not fact_extractor:
+        logger.warning(f"[FACT-DISCOVERY] Fact extractor not available for session {session_id}")
+        return
+    
+    try:
+        # Get session data
+        history = conversation_history.get(session_id, [])
+        used_results = used_search_results.get(session_id, [])
+        seen_hashes = seen_fact_hashes.get(session_id, set())
+        
+        logger.info(f"[FACT-DISCOVERY] Session data - History: {len(history)} messages, Used results: {len(used_results)} chunks, Seen hashes: {len(seen_hashes)}")
+        
+        if not history or not used_results:
+            logger.info(f"[FACT-DISCOVERY] Skipping - insufficient data (history: {len(history)}, used_results: {len(used_results)})")
+            return
+        
+        # Process facts
+        logger.info(f"[FACT-DISCOVERY] Processing facts...")
+        new_facts = await fact_extractor.process_facts(
+            history,
+            used_results,
+            seen_hashes
+        )
+        
+        logger.info(f"[FACT-DISCOVERY] Found {len(new_facts)} new facts")
+        for i, fact_text in enumerate(new_facts, 1):
+            logger.info(f"[FACT-DISCOVERY] Fact {i}/{len(new_facts)}: {fact_text[:100]}...")
+        
+        # Add to pending facts
+        for fact_text in new_facts:
+            fact_id = str(uuid.uuid4())
+            pending_facts[session_id].append({
+                "fact_id": fact_id,
+                "fact": fact_text,
+                "status": "pending",
+                "created_at": datetime.utcnow().isoformat()
+            })
+            logger.info(f"[FACT-DISCOVERY] Added fact to pending (ID: {fact_id}): {fact_text[:80]}...")
+        
+        logger.info(f"[FACT-DISCOVERY] Completed fact discovery for session {session_id} - {len(new_facts)} facts added to pending")
+        
+    except Exception as e:
+        logger.error(f"[FACT-DISCOVERY] Error processing facts for session {session_id}: {e}", exc_info=True)
+
+# Background worker for fact discovery (kept for compatibility, but may not be used)
 async def fact_discovery_worker():
     """Background worker that processes fact-discovery jobs."""
     while True:
         try:
             session_id = await fact_discovery_queue.get()
             
-            # Get session data
-            history = conversation_history.get(session_id, [])
-            used_results = used_search_results.get(session_id, [])
-            seen_hashes = seen_fact_hashes.get(session_id, set())
-            
-            if not history or not used_results:
-                continue
-            
-            # Process facts
-            new_facts = await fact_extractor.process_facts(
-                history,
-                used_results,
-                seen_hashes
-            )
-            
-            # Add to pending facts
-            for fact_text in new_facts:
-                fact_id = str(uuid.uuid4())
-                pending_facts[session_id].append({
-                    "fact_id": fact_id,
-                    "fact": fact_text,
-                    "status": "pending",
-                    "created_at": datetime.utcnow().isoformat()
-                })
+            # Process facts using the same function
+            await process_facts_for_session(session_id)
             
             fact_discovery_queue.task_done()
             
@@ -172,23 +220,38 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     
     try:
+        logger.info(f"[CHAT] Session: {session_id} | User message: {message[:100]}...")
+        
         # Step 1: Generate search terms
         history = conversation_history.get(session_id, [])
+        logger.info(f"[CHAT] Step 1: Generating search terms (history length: {len(history)})")
         search_terms = await rag_search.generate_search_terms(message, history)
+        logger.info(f"[CHAT] Step 1: Generated {len(search_terms)} search terms: {search_terms}")
         
         # Step 2: Vector search for each term
+        logger.info(f"[CHAT] Step 2: Performing vector search for {len(search_terms)} terms")
         search_results = await rag_search.search_multiple_terms(search_terms, k_per_term=10)
+        logger.info(f"[CHAT] Step 2: Found {len(search_results)} total search results")
         
-        # Step 3: Limit context chunks (max ~8000 tokens)
-        context_chunks = rag_search.get_chunk_texts(search_results, max_tokens=8000)
+        # Log unique chunk IDs found
+        unique_chunk_ids = {chunk["chunk_id"] for chunk in search_results}
+        logger.info(f"[CHAT] Step 2: Unique chunks found: {len(unique_chunk_ids)} chunks (IDs: {sorted(list(unique_chunk_ids))[:10]}...)")
+        
+        # Step 3: Get all context chunks (no token limit)
+        logger.info(f"[CHAT] Step 3: Getting all context chunks (no token limit)")
+        context_chunks = rag_search.get_chunk_texts(search_results, max_tokens=999999999)
         context_text = "\n\n".join(context_chunks)
+        logger.info(f"[CHAT] Step 3: Selected {len(context_chunks)} context chunks for answer generation")
         
         # Step 4: Update used search results (deduplicate by chunk_id)
         existing_chunk_ids = {chunk["chunk_id"] for chunk in used_search_results[session_id]}
+        new_chunks_count = 0
         for chunk in search_results:
             if chunk["chunk_id"] not in existing_chunk_ids:
                 used_search_results[session_id].append(chunk)
                 existing_chunk_ids.add(chunk["chunk_id"])
+                new_chunks_count += 1
+        logger.info(f"[CHAT] Step 4: Added {new_chunks_count} new chunks to used_search_results (total: {len(used_search_results[session_id])})")
         
         # Step 5: Generate answer
         history_text = ""
@@ -199,6 +262,8 @@ async def chat(request: ChatRequest):
                 for msg in recent_history
             ])
         
+        history_section = f"RECENT CONVERSATION HISTORY:\n{history_text}" if history_text else ""
+        
         prompt = f"""You are a helpful Mass Effect lore assistant. Answer questions about the Mass Effect universe using the provided context and conversation history.
 
 USER QUESTION: {message}
@@ -206,7 +271,7 @@ USER QUESTION: {message}
 CONTEXT FROM KNOWLEDGE BASE:
 {context_text}
 
-{f'RECENT CONVERSATION HISTORY:\n{history_text}' if history_text else ''}
+{history_section}
 
 Instructions:
 - Provide accurate, detailed answers based on the context
@@ -216,24 +281,29 @@ Instructions:
 - If the user asks in another language, still respond in English (as the assistant)
 """
         
+        logger.info(f"[CHAT] Step 5: Generating answer with model azure.gpt-5")
         answer = await client.text_completion(
             prompt=prompt,
             model_name="azure.gpt-5",
             max_tokens=15000,
             temperature=0.7
         )
+        logger.info(f"[CHAT] Step 5: Generated answer (length: {len(answer)} chars)")
         
         # Step 6: Update conversation history
         conversation_history[session_id].append({"role": "user", "content": message})
         conversation_history[session_id].append({"role": "assistant", "content": answer})
+        logger.info(f"[CHAT] Step 6: Updated conversation history (total messages: {len(conversation_history[session_id])})")
         
-        # Step 7: Enqueue fact-discovery job (non-blocking)
-        if fact_discovery_queue is not None:
-            try:
-                fact_discovery_queue.put_nowait(session_id)
-            except asyncio.QueueFull:
-                pass  # Skip if queue is full
+        # Step 7: Process facts immediately in background (non-blocking)
+        if fact_extractor is not None:
+            logger.info(f"[CHAT] Step 7: Starting fact discovery for session {session_id}")
+            # Start fact discovery immediately as a background task
+            asyncio.create_task(process_facts_for_session(session_id))
+        else:
+            logger.warning(f"[CHAT] Step 7: Fact extractor not available, skipping fact discovery")
         
+        logger.info(f"[CHAT] Session: {session_id} | Response sent successfully")
         return ChatResponse(response=answer)
         
     except Exception as e:

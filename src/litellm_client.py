@@ -24,17 +24,21 @@ class AsyncLiteLLMClient:
         Initialize the async LiteLLM client.
         
         Args:
-            api_base: The API base URL (default: from OPENAI_API_BASE env var)
-            api_key: The API key (default: from OPENAI_API_KEY env var)
+            api_base: The API base URL (default: hardcoded value)
+            api_key: The API key (default: hardcoded value)
         """
-        # Read from environment variables if not provided
-        self.api_base = api_base or os.getenv("OPENAI_API_BASE")
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        # Hardcoded default values
+        default_api_base = "https://genai-sharedservice-emea.pwc.com"
+        default_api_key = "sk-ufuH2c5myyTx3hPOpOrMZg"
+        
+        # Use provided values, then hardcoded defaults, then environment variables as fallback
+        self.api_base = api_base or default_api_base or os.getenv("OPENAI_API_BASE")
+        self.api_key = api_key or default_api_key or os.getenv("OPENAI_API_KEY")
         
         if not self.api_base:
-            raise ValueError("OPENAI_API_BASE environment variable must be set")
+            raise ValueError("OPENAI_API_BASE must be set")
         if not self.api_key:
-            raise ValueError("OPENAI_API_KEY environment variable must be set")
+            raise ValueError("OPENAI_API_KEY must be set")
         
         os.environ["OPENAI_API_BASE"] = self.api_base
         os.environ["OPENAI_API_KEY"] = self.api_key
