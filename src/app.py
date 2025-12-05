@@ -272,6 +272,17 @@ async def chat(request: ChatRequest):
                 new_chunks_count += 1
         logger.info(f"[CHAT] Step 4: Added {new_chunks_count} new chunks to used_search_results (total: {len(used_search_results[session_id])})")
         
+        # Step 4.5: Start fact discovery immediately in background (non-blocking)
+        # This starts as soon as we have the search results, before generating the answer
+        if fact_extractor is not None:
+            logger.info(f"[CHAT] Step 4.5: Starting fact discovery immediately for session {session_id}")
+            # Update conversation history with user message first (needed for fact extraction)
+            conversation_history[session_id].append({"role": "user", "content": message})
+            # Start fact discovery immediately as a background task
+            asyncio.create_task(process_facts_for_session(session_id))
+        else:
+            logger.warning(f"[CHAT] Step 4.5: Fact extractor not available, skipping fact discovery")
+        
         # Step 5: Generate answer
         history_text = ""
         if history:
@@ -318,15 +329,9 @@ Instructions:
         # Step 6: Update conversation history
         conversation_history[session_id].append({"role": "user", "content": message})
         conversation_history[session_id].append({"role": "assistant", "content": answer})
+        # Step 6: Update conversation history with assistant response
+        conversation_history[session_id].append({"role": "assistant", "content": answer})
         logger.info(f"[CHAT] Step 6: Updated conversation history (total messages: {len(conversation_history[session_id])})")
-        
-        # Step 7: Process facts immediately in background (non-blocking)
-        if fact_extractor is not None:
-            logger.info(f"[CHAT] Step 7: Starting fact discovery for session {session_id}")
-            # Start fact discovery immediately as a background task
-            asyncio.create_task(process_facts_for_session(session_id))
-        else:
-            logger.warning(f"[CHAT] Step 7: Fact extractor not available, skipping fact discovery")
         
         logger.info(f"[CHAT] Session: {session_id} | Response sent successfully")
         return ChatResponse(response=answer)
@@ -340,10 +345,14 @@ Instructions:
 @app.get("/api/facts/pending", response_model=PendingFactsResponse)
 async def get_pending_facts(session_id: str):
     """Get pending facts for a session."""
+    logger.info(f"[FACTS-API] Getting pending facts for session: {session_id}")
+    session_facts = pending_facts.get(session_id, [])
+    logger.info(f"[FACTS-API] Total facts in session: {len(session_facts)}")
     facts = [
-        fact for fact in pending_facts.get(session_id, [])
-        if fact["status"] == "pending"
+        fact for fact in session_facts
+        if fact.get("status") == "pending"
     ]
+    logger.info(f"[FACTS-API] Returning {len(facts)} pending facts")
     return PendingFactsResponse(facts=facts)
 
 
