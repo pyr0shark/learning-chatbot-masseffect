@@ -119,7 +119,7 @@ class RAGSearch:
         conversation_history: List[Dict[str, str]] = None
     ) -> List[str]:
         """
-        Generate search terms from user question using GPT-5-nano.
+        Generate search terms from user question using GPT-5-mini.
         
         Args:
             user_question: User's question
@@ -155,7 +155,7 @@ Output only the search terms, one per line, without numbering or bullets.
         
         response = await self.client.text_completion(
             prompt=prompt,
-            model_name="azure.gpt-5-nano",
+            model_name="azure.gpt-5-mini",
             max_tokens=20000,
             temperature=0.3
         )

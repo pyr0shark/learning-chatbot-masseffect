@@ -412,13 +412,28 @@ class Chatbot {
                 throw new Error('Failed to reject fact');
             }
             
-            // Remove fact message
+            // Get fact text before removing the message
             const factMessage = document.querySelector(`[data-fact-id="${factId}"]`);
+            let factText = '';
             if (factMessage) {
+                const editInput = factMessage.querySelector('.fact-edit-input');
+                const factTextElement = factMessage.querySelector('.fact-text');
+                // Get the current fact text (either from edit input if visible, or from fact text element)
+                if (editInput && editInput.style.display !== 'none') {
+                    factText = editInput.value;
+                } else if (factTextElement) {
+                    // Extract text from the fact text element (remove the "New fact discovered:" prefix)
+                    const textContent = factTextElement.textContent || factTextElement.innerText;
+                    factText = textContent.replace(/^New fact discovered:\s*/i, '').trim();
+                }
                 factMessage.remove();
             }
             
-            this.addMessage('❌ Fact rejected.', 'bot');
+            // Show rejection message with fact text
+            const rejectionMessage = factText 
+                ? `❌ Fact rejected.\n\n📝 **Fact:** ${factText}`
+                : '❌ Fact rejected.';
+            this.addMessage(rejectionMessage, 'bot');
         } catch (error) {
             console.error('Error rejecting fact:', error);
             this.addMessage('❌ Error rejecting fact. Please try again.', 'bot');

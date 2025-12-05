@@ -63,6 +63,7 @@ conversation_history: Dict[str, List[Dict[str, str]]] = defaultdict(list)
 used_search_results: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 pending_facts: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 seen_fact_hashes: Dict[str, set] = defaultdict(set)
+previously_extracted_facts: Dict[str, List[str]] = defaultdict(list)  # Track all candidate facts extracted in this session
 
 # Background task queue (will be initialized in startup)
 fact_discovery_queue: Optional[asyncio.Queue] = None
@@ -91,6 +92,11 @@ class ApproveFactRequest(BaseModel):
 class RejectFactRequest(BaseModel):
     session_id: str
     fact_id: str
+
+
+class AllFactsResponse(BaseModel):
+    approved: List[Dict[str, Any]]
+    rejected: List[Dict[str, Any]]
 
 
 # Startup event
@@ -151,19 +157,30 @@ async def process_facts_for_session(session_id: str):
             logger.info(f"[FACT-DISCOVERY] Skipping - insufficient data (history: {len(history)}, used_results: {len(used_results)})")
             return
         
+        # Get previously extracted facts for this session
+        prev_extracted = previously_extracted_facts.get(session_id, [])
+        
+        # Also include all facts from pending_facts (approved, rejected, or pending) to avoid re-extraction
+        pending_facts_list = pending_facts.get(session_id, [])
+        pending_fact_texts = [fact["fact"] for fact in pending_facts_list]
+        prev_extracted = list(set(prev_extracted + pending_fact_texts))  # Combine and deduplicate
+        
+        logger.info(f"[FACT-DISCOVERY] Previously extracted facts in this session: {len(prev_extracted)} (including {len(pending_facts_list)} from pending_facts)")
+        
         # Process facts
         logger.info(f"[FACT-DISCOVERY] Processing facts...")
         new_facts = await fact_extractor.process_facts(
             history,
             used_results,
-            seen_hashes
+            seen_hashes,
+            prev_extracted
         )
         
         logger.info(f"[FACT-DISCOVERY] Found {len(new_facts)} new facts")
         for i, fact_text in enumerate(new_facts, 1):
             logger.info(f"[FACT-DISCOVERY] Fact {i}/{len(new_facts)}: {fact_text[:100]}...")
         
-        # Add to pending facts
+        # Add to pending facts and track as previously extracted
         for fact_text in new_facts:
             fact_id = str(uuid.uuid4())
             pending_facts[session_id].append({
@@ -172,9 +189,11 @@ async def process_facts_for_session(session_id: str):
                 "status": "pending",
                 "created_at": datetime.utcnow().isoformat()
             })
+            # Track this fact as previously extracted to avoid extracting it again
+            previously_extracted_facts[session_id].append(fact_text)
             logger.info(f"[FACT-DISCOVERY] Added fact to pending (ID: {fact_id}): {fact_text[:80]}...")
         
-        logger.info(f"[FACT-DISCOVERY] Completed fact discovery for session {session_id} - {len(new_facts)} facts added to pending")
+        logger.info(f"[FACT-DISCOVERY] Completed fact discovery for session {session_id} - {len(new_facts)} facts added to pending (total extracted in session: {len(previously_extracted_facts[session_id])})")
         
     except Exception as e:
         logger.error(f"[FACT-DISCOVERY] Error processing facts for session {session_id}: {e}", exc_info=True)
@@ -274,17 +293,23 @@ CONTEXT FROM KNOWLEDGE BASE:
 {history_section}
 
 Instructions:
-- Provide accurate, detailed answers based on the context
-- If the context doesn't contain enough information, say so
-- Reference specific characters, events, or locations when relevant
-- Keep answers clear and well-structured
+- You are ONLY allowed to use knowledge that is explicitly stated in the CONTEXT FROM KNOWLEDGE BASE above
+- You must NOT use any external knowledge, general knowledge, or information not present in the provided context
+- Provide a complete, detailed, and comprehensive answer based ONLY on the context provided
+- Answer the question fully using all relevant information from the context
+- Do NOT start your response with phrases like "Short answer:" or "Brief answer:" - just provide the answer directly
+- Do NOT add notes, disclaimers, or statements about what information is or is not in the knowledge base
+- Simply answer the question using the information available in the context
+- If the context doesn't contain enough information to fully answer the question, provide what you can from the context and do not mention what is missing
+- Reference specific characters, events, or locations when relevant (only if they appear in the context)
+- Keep answers clear, well-structured, and complete
 - If the user asks in another language, still respond in English (as the assistant)
 """
         
-        logger.info(f"[CHAT] Step 5: Generating answer with model azure.gpt-5")
+        logger.info(f"[CHAT] Step 5: Generating answer with model azure.gpt-5-mini")
         answer = await client.text_completion(
             prompt=prompt,
-            model_name="azure.gpt-5",
+            model_name="azure.gpt-5-mini",
             max_tokens=15000,
             temperature=0.7
         )
@@ -405,6 +430,34 @@ async def reject_fact(request: RejectFactRequest):
     fact["rejected_at"] = datetime.utcnow().isoformat()
     
     return {"status": "success", "message": "Fact rejected"}
+
+
+# Get all facts (approved and rejected)
+@app.get("/api/facts/all", response_model=AllFactsResponse)
+async def get_all_facts():
+    """Get all approved and rejected facts from all sessions."""
+    approved_facts = []
+    rejected_facts = []
+    
+    # Collect all facts from all sessions
+    for session_id, facts in pending_facts.items():
+        for fact in facts:
+            if fact.get("status") == "approved":
+                approved_facts.append({
+                    **fact,
+                    "session_id": session_id
+                })
+            elif fact.get("status") == "rejected":
+                rejected_facts.append({
+                    **fact,
+                    "session_id": session_id
+                })
+    
+    # Sort by date (most recent first)
+    approved_facts.sort(key=lambda x: x.get("approved_at", ""), reverse=True)
+    rejected_facts.sort(key=lambda x: x.get("rejected_at", ""), reverse=True)
+    
+    return AllFactsResponse(approved=approved_facts, rejected=rejected_facts)
 
 
 if __name__ == "__main__":

@@ -56,7 +56,8 @@ class FactExtractor:
     async def extract_candidate_facts(
         self,
         conversation_history: List[Dict[str, str]],
-        used_search_results: List[Dict[str, Any]]
+        used_search_results: List[Dict[str, Any]],
+        previously_extracted_facts: List[str] = None
     ) -> List[str]:
         """
         Extract candidate facts from conversation that are not in used search results.
@@ -64,10 +65,13 @@ class FactExtractor:
         Args:
             conversation_history: Full conversation history
             used_search_results: All chunks used in RAG answers for this session
+            previously_extracted_facts: List of facts already extracted in this session (to avoid duplicates)
             
         Returns:
             List of candidate fact strings
         """
+        if previously_extracted_facts is None:
+            previously_extracted_facts = []
         logger.info(f"[FACT-EXTRACTOR] Extracting candidate facts - History: {len(conversation_history)} messages, Used results: {len(used_search_results)} chunks")
         
         # Build conversation text
@@ -83,6 +87,11 @@ class FactExtractor:
         
         logger.debug(f"[FACT-EXTRACTOR] Conversation text length: {len(conversation_text)} chars, Used results text length: {len(used_results_text)} chars")
         
+        # Build previously extracted facts text
+        previously_extracted_text = ""
+        if previously_extracted_facts:
+            previously_extracted_text = "\n\nPREVIOUSLY EXTRACTED FACTS (already found in this session - do NOT extract these again):\n" + "\n".join([f"- {fact}" for fact in previously_extracted_facts])
+        
         prompt = f"""You are analyzing a conversation about Mass Effect lore to extract new factual statements that are not already present in the knowledge base.
 
 CONVERSATION HISTORY:
@@ -91,22 +100,25 @@ CONVERSATION HISTORY:
 KNOWLEDGE BASE CONTENT (already used in answers):
 {used_results_text}
 
+{previously_extracted_text}
+
 Your task: Extract factual statements from the conversation that:
 1. Are about Mass Effect lore (characters, events, locations, technology, history, factions, etc.)
 2. Are explicitly stated in the conversation (not invented or inferred)
 3. Are NOT present in the knowledge base content above (even if paraphrased)
-4. Are not questions, opinions, or speculation
-5. Are clear, specific, and self-contained factual statements
-6. Are genuinely new information relative to the knowledge base
+4. Are NOT in the previously extracted facts list above (if provided)
+5. Are not questions, opinions, or speculation
+6. Are clear, specific, and self-contained factual statements
+7. Are genuinely new information relative to the knowledge base and previously extracted facts
 
 Output each fact on a separate line. Each fact should be a complete, standalone statement.
 If no new facts are found, output only "NONE".
 """
         
-        logger.info(f"[FACT-EXTRACTOR] Calling GPT-5-nano to extract candidate facts")
+        logger.info(f"[FACT-EXTRACTOR] Calling GPT-5-mini to extract candidate facts")
         response = await self.client.text_completion(
             prompt=prompt,
-            model_name="azure.gpt-5-nano",
+            model_name="azure.gpt-5-mini",
             max_tokens=20000,
             temperature=0.3
         )
@@ -122,7 +134,7 @@ If no new facts are found, output only "NONE".
     
     async def check_index_presence(self, fact_text: str) -> bool:
         """
-        Check if a fact is already present in the index using top-10 nearest + GPT-5-nano boolean check.
+        Check if a fact is already present in the index using top-10 nearest + GPT-5-mini boolean check.
         
         Args:
             fact_text: Fact text to check
@@ -156,10 +168,10 @@ Question: Does the information in these knowledge base chunks already contain th
 Answer with only "true" or "false" (lowercase, no punctuation, no explanation).
 """
         
-        logger.debug(f"[FACT-EXTRACTOR] Calling GPT-5-nano to check if fact is already in index")
+        logger.debug(f"[FACT-EXTRACTOR] Calling GPT-5-mini to check if fact is already in index")
         response = await self.client.text_completion(
             prompt=prompt,
-            model_name="azure.gpt-5-nano",
+            model_name="azure.gpt-5-mini",
             max_tokens=20000,
             temperature=0.3
         )
@@ -167,14 +179,15 @@ Answer with only "true" or "false" (lowercase, no punctuation, no explanation).
         # Parse boolean response
         response_lower = response.strip().lower()
         is_present = response_lower.startswith("true")
-        logger.info(f"[FACT-EXTRACTOR] Index presence check result: {'PRESENT' if is_present else 'NEW'} (response: {response_lower[:20]})")
+        logger.info(f"[FACT-EXTRACTOR] Index presence check result: {'PRESENT' if is_present else 'NEW'} for fact: {fact_text[:100]}... (response: {response_lower[:20]})")
         return is_present
     
     async def process_facts(
         self,
         conversation_history: List[Dict[str, str]],
         used_search_results: List[Dict[str, Any]],
-        seen_fact_hashes: Set[str] = None
+        seen_fact_hashes: Set[str] = None,
+        previously_extracted_facts: List[str] = None
     ) -> List[str]:
         """
         Complete fact processing pipeline: extract candidates and check against index.
@@ -183,20 +196,25 @@ Answer with only "true" or "false" (lowercase, no punctuation, no explanation).
             conversation_history: Full conversation history
             used_search_results: All chunks used in RAG answers
             seen_fact_hashes: Set of fact hashes already seen (for deduplication)
+            previously_extracted_facts: List of facts already extracted in this session
             
         Returns:
             List of new facts that passed all checks
         """
-        logger.info(f"[FACT-EXTRACTOR] Starting fact processing pipeline (seen_hashes: {len(seen_fact_hashes) if seen_fact_hashes else 0})")
+        if previously_extracted_facts is None:
+            previously_extracted_facts = []
+        
+        logger.info(f"[FACT-EXTRACTOR] Starting fact processing pipeline (seen_hashes: {len(seen_fact_hashes) if seen_fact_hashes else 0}, previously_extracted: {len(previously_extracted_facts)})")
         
         if seen_fact_hashes is None:
             seen_fact_hashes = set()
         
         # Step 1: Extract candidate facts
-        logger.info(f"[FACT-EXTRACTOR] Step 1: Extracting candidate facts")
+        logger.info(f"[FACT-EXTRACTOR] Step 1: Extracting candidate facts (excluding {len(previously_extracted_facts)} previously extracted facts)")
         candidate_facts = await self.extract_candidate_facts(
             conversation_history,
-            used_search_results
+            used_search_results,
+            previously_extracted_facts
         )
         
         if not candidate_facts:
@@ -225,13 +243,13 @@ Answer with only "true" or "false" (lowercase, no punctuation, no explanation).
         logger.info(f"[FACT-EXTRACTOR] Step 3: Checking {len(new_candidates)} candidates against index")
         new_facts = []
         for i, fact in enumerate(new_candidates, 1):
-            logger.info(f"[FACT-EXTRACTOR] Checking candidate {i}/{len(new_candidates)}")
+            logger.info(f"[FACT-EXTRACTOR] Checking candidate {i}/{len(new_candidates)}: {fact[:100]}...")
             is_present = await self.check_index_presence(fact)
             if not is_present:
                 new_facts.append(fact)
-                logger.info(f"[FACT-EXTRACTOR] Candidate {i} is NEW - added to final list")
+                logger.info(f"[FACT-EXTRACTOR] Candidate {i} is NEW - added to final list. Fact: {fact[:100]}...")
             else:
-                logger.info(f"[FACT-EXTRACTOR] Candidate {i} is already in index - skipped")
+                logger.info(f"[FACT-EXTRACTOR] Candidate {i} is already in index - skipped. Fact: {fact[:100]}...")
         
         logger.info(f"[FACT-EXTRACTOR] Fact processing complete: {len(new_facts)} new facts found out of {len(candidate_facts)} candidates")
         return new_facts

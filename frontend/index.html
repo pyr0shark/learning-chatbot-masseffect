@@ -7,7 +7,23 @@
     <link rel="stylesheet" href="/frontend/styles.css">
 </head>
 <body>
-    <div class="chat-container">
+    <div class="app-container">
+        <aside class="sidebar">
+            <nav class="sidebar-nav">
+                <button class="nav-button active" data-page="chat">
+                    <span class="nav-icon">💬</span>
+                    <span class="nav-text">Chat</span>
+                </button>
+                <button class="nav-button" data-page="facts">
+                    <span class="nav-icon">📝</span>
+                    <span class="nav-text">Facts</span>
+                </button>
+            </nav>
+        </aside>
+        
+        <main class="main-content">
+            <div id="chat-page" class="page active">
+                <div class="chat-container">
         <div class="chat-header">
             <h1>Mass Effect Lore Assistant</h1>
             <div class="status-indicator">
@@ -41,8 +57,46 @@
             </div>
         </div>
     </div>
+            </div>
+            
+            <div id="facts-page" class="page">
+                <div class="page-container">
+                    <div class="page-header">
+                        <h1>Facts</h1>
+                    </div>
+                    <div class="page-content">
+                        <div class="facts-sections">
+                            <div class="facts-section">
+                                <h2 class="facts-section-title approved">
+                                    <span class="facts-icon">✅</span>
+                                    Approved Facts
+                                    <span class="facts-count" id="approved-count">0</span>
+                                </h2>
+                                <div class="facts-list" id="approved-facts">
+                                    <div class="loading-message">Loading approved facts...</div>
+                                </div>
+                            </div>
+                            
+                            <div class="facts-section">
+                                <h2 class="facts-section-title rejected">
+                                    <span class="facts-icon">❌</span>
+                                    Rejected Facts
+                                    <span class="facts-count" id="rejected-count">0</span>
+                                </h2>
+                                <div class="facts-list" id="rejected-facts">
+                                    <div class="loading-message">Loading rejected facts...</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
     
+    <script src="/frontend/router.js"></script>
     <script src="/frontend/chatbot.js"></script>
+    <script src="/frontend/facts.js"></script>
 </body>
 </html>
 
