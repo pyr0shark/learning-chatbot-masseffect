@@ -6,14 +6,13 @@ class Chatbot {
         this.apiEndpoint = '/api/chat'; // Backend API endpoint (same server)
         this.sessionId = this.getOrCreateSessionId(); // Session ID for conversation history
         this.displayedFactIds = new Set(); // Track which facts have been displayed
-        this.factPollingInterval = null; // Track polling interval
+        this.factEventSource = null; // SSE connection
         
         this.initializeEventListeners();
         this.autoResizeTextarea();
         
-        // Start polling immediately to catch any existing pending facts
-        // This is useful if facts were discovered before the page loaded
-        this.startFactPolling();
+        // Start SSE connection for real-time fact updates
+        this.startFactStream();
     }
     
     getOrCreateSessionId() {
@@ -60,9 +59,10 @@ class Chatbot {
         // Add user message
         this.addMessage(message, 'user');
         
-        // Start polling for pending facts immediately when user sends message
-        // Fact discovery starts on the backend as soon as the message is received
-        this.startFactPolling();
+        // Ensure SSE connection is active (fact discovery starts on backend immediately)
+        if (!this.factEventSource || this.factEventSource.readyState === EventSource.CLOSED) {
+            this.startFactStream();
+        }
         
         // Show typing indicator
         const typingId = this.showTypingIndicator();
@@ -220,59 +220,51 @@ class Chatbot {
         this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
     }
     
-    startFactPolling() {
-        // Clear any existing polling
-        if (this.factPollingInterval) {
-            clearInterval(this.factPollingInterval);
+    startFactStream() {
+        // Close existing connection if any
+        if (this.factEventSource) {
+            this.factEventSource.close();
         }
         
-        // Check immediately
-        this.checkPendingFacts();
+        // Create new SSE connection
+        const url = `/api/facts/stream?session_id=${encodeURIComponent(this.sessionId)}`;
+        console.log('Starting SSE connection for facts:', url);
+        this.factEventSource = new EventSource(url);
         
-        // Poll every 3 seconds for up to 5 minutes to catch facts
-        // This gives plenty of time for fact discovery which can take a while
-        let pollCount = 0;
-        const maxPolls = 100; // 100 polls * 3s = 5 minutes
-        
-        this.factPollingInterval = setInterval(() => {
-            pollCount++;
-            this.checkPendingFacts();
-            
-            if (pollCount >= maxPolls) {
-                clearInterval(this.factPollingInterval);
-                this.factPollingInterval = null;
-                console.log('Fact polling stopped after 5 minutes');
-            }
-        }, 3000); // Poll every 3 seconds
-    }
-    
-    async checkPendingFacts() {
-        try {
-            const response = await fetch(`/api/facts/pending?session_id=${encodeURIComponent(this.sessionId)}`);
-            if (!response.ok) {
-                console.warn('Failed to fetch pending facts:', response.status);
-                return;
-            }
-            
-            const data = await response.json();
-            if (data.facts && data.facts.length > 0) {
-                console.log(`Found ${data.facts.length} pending facts for session ${this.sessionId}`);
-                // Display pending facts that haven't been shown yet
-                for (const factData of data.facts) {
-                    if (factData.status === 'pending' && !this.displayedFactIds.has(factData.fact_id)) {
-                        // Check if fact element already exists in DOM
-                        const existingFact = document.querySelector(`[data-fact-id="${factData.fact_id}"]`);
-                        if (!existingFact) {
-                            console.log('Displaying new fact:', factData.fact_id, factData.fact.substring(0, 50));
-                            this.displayPendingFact(factData);
-                            this.displayedFactIds.add(factData.fact_id);
-                        }
+        this.factEventSource.onmessage = (event) => {
+            try {
+                const factData = JSON.parse(event.data);
+                console.log('Received fact via SSE:', factData.fact_id, factData.fact.substring(0, 50));
+                
+                // Display fact if not already shown
+                if (factData.status === 'pending' && !this.displayedFactIds.has(factData.fact_id)) {
+                    const existingFact = document.querySelector(`[data-fact-id="${factData.fact_id}"]`);
+                    if (!existingFact) {
+                        this.displayPendingFact(factData);
+                        this.displayedFactIds.add(factData.fact_id);
                     }
                 }
+            } catch (error) {
+                console.error('Error parsing SSE message:', error);
             }
-        } catch (error) {
-            console.error('Error checking pending facts:', error);
-        }
+        };
+        
+        this.factEventSource.onerror = (error) => {
+            console.error('SSE connection error:', error);
+            // Connection will auto-reconnect, but we can also manually reconnect if needed
+            if (this.factEventSource.readyState === EventSource.CLOSED) {
+                console.log('SSE connection closed, will attempt to reconnect...');
+                setTimeout(() => {
+                    if (this.factEventSource.readyState === EventSource.CLOSED) {
+                        this.startFactStream();
+                    }
+                }, 3000);
+            }
+        };
+        
+        this.factEventSource.onopen = () => {
+            console.log('SSE connection opened for facts');
+        };
     }
     
     displayPendingFact(factData) {

@@ -22,8 +22,9 @@ logger = logging.getLogger(__name__)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+import json
 
 try:
     # Relative imports when used as a module
@@ -64,6 +65,9 @@ used_search_results: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 pending_facts: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 seen_fact_hashes: Dict[str, set] = defaultdict(set)
 previously_extracted_facts: Dict[str, List[str]] = defaultdict(list)  # Track all candidate facts extracted in this session
+
+# SSE event queues for pushing facts to clients
+fact_event_queues: Dict[str, asyncio.Queue] = {}
 
 # Background task queue (will be initialized in startup)
 fact_discovery_queue: Optional[asyncio.Queue] = None
@@ -183,15 +187,24 @@ async def process_facts_for_session(session_id: str):
         # Add to pending facts and track as previously extracted
         for fact_text in new_facts:
             fact_id = str(uuid.uuid4())
-            pending_facts[session_id].append({
+            fact_data = {
                 "fact_id": fact_id,
                 "fact": fact_text,
                 "status": "pending",
                 "created_at": datetime.utcnow().isoformat()
-            })
+            }
+            pending_facts[session_id].append(fact_data)
             # Track this fact as previously extracted to avoid extracting it again
             previously_extracted_facts[session_id].append(fact_text)
             logger.info(f"[FACT-DISCOVERY] Added fact to pending (ID: {fact_id}): {fact_text[:80]}...")
+            
+            # Push fact to SSE stream for this session
+            if session_id in fact_event_queues:
+                try:
+                    await fact_event_queues[session_id].put(fact_data)
+                    logger.info(f"[FACT-DISCOVERY] Pushed fact {fact_id} to SSE stream for session {session_id}")
+                except Exception as e:
+                    logger.warning(f"[FACT-DISCOVERY] Failed to push fact to SSE stream: {e}")
         
         logger.info(f"[FACT-DISCOVERY] Completed fact discovery for session {session_id} - {len(new_facts)} facts added to pending (total extracted in session: {len(previously_extracted_facts[session_id])})")
         
@@ -341,7 +354,7 @@ Instructions:
         raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
 
 
-# Get pending facts
+# Get pending facts (kept for backwards compatibility, but SSE is preferred)
 @app.get("/api/facts/pending", response_model=PendingFactsResponse)
 async def get_pending_facts(session_id: str):
     """Get pending facts for a session."""
@@ -354,6 +367,51 @@ async def get_pending_facts(session_id: str):
     ]
     logger.info(f"[FACTS-API] Returning {len(facts)} pending facts")
     return PendingFactsResponse(facts=facts)
+
+
+# SSE endpoint for real-time fact updates
+@app.get("/api/facts/stream")
+async def stream_facts(session_id: str):
+    """Server-Sent Events stream for real-time fact updates."""
+    async def event_generator():
+        # Create queue for this session if it doesn't exist
+        if session_id not in fact_event_queues:
+            fact_event_queues[session_id] = asyncio.Queue()
+        
+        queue = fact_event_queues[session_id]
+        
+        # Send any existing pending facts first
+        session_facts = pending_facts.get(session_id, [])
+        pending = [f for f in session_facts if f.get("status") == "pending"]
+        for fact in pending:
+            yield f"data: {json.dumps(fact)}\n\n"
+        
+        # Keep connection alive and send new facts as they arrive
+        try:
+            while True:
+                # Wait for new fact with timeout to send keepalive
+                try:
+                    fact = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(fact)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send keepalive comment
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            logger.info(f"[SSE] Connection closed for session {session_id}")
+        finally:
+            # Clean up queue when connection closes
+            if session_id in fact_event_queues:
+                del fact_event_queues[session_id]
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 # Approve fact
