@@ -78,8 +78,8 @@ class Chatbot {
             // Remove typing indicator
             this.removeTypingIndicator(typingId);
             
-            // Add bot response
-            this.addMessage(responseData.response || responseData, 'bot');
+            // Add bot response with references
+            this.addMessage(responseData.response || responseData, 'bot', responseData.references || []);
         } catch (error) {
             // Remove typing indicator
             this.removeTypingIndicator(typingId);
@@ -115,6 +115,8 @@ class Chatbot {
             }
             
             const data = await response.json();
+            console.log('API Response:', data);
+            console.log('References:', data.references);
             return data; // Return full response object
         } catch (error) {
             // Log the actual error for debugging
@@ -149,7 +151,7 @@ class Chatbot {
         return { response: responseText, pending_facts_count: 0 };
     }
     
-    addMessage(text, sender) {
+    addMessage(text, sender, references = []) {
         const messageDiv = document.createElement('div');
         messageDiv.className = `message ${sender}-message`;
         
@@ -164,11 +166,75 @@ class Chatbot {
         const formattedText = this.formatMessage(text);
         content.innerHTML = formattedText;
         
+        // Add references dropdown for bot messages with references
+        console.log('addMessage - sender:', sender, 'references:', references, 'isArray:', Array.isArray(references), 'length:', references?.length);
+        if (sender === 'bot' && references && Array.isArray(references) && references.length > 0) {
+            console.log('Creating references dropdown with', references.length, 'references:', references);
+            const referencesContainer = this.createReferencesDropdown(references);
+            content.appendChild(referencesContainer);
+            console.log('References container added to content');
+        }
+        
         messageDiv.appendChild(avatar);
         messageDiv.appendChild(content);
         
         this.messagesContainer.appendChild(messageDiv);
         this.scrollToBottom();
+    }
+    
+    createReferencesDropdown(references) {
+        console.log('createReferencesDropdown called with:', references);
+        const container = document.createElement('div');
+        container.className = 'references-container';
+        
+        const dropdownButton = document.createElement('button');
+        dropdownButton.className = 'references-toggle';
+        dropdownButton.textContent = `References (${references.length})`;
+        dropdownButton.setAttribute('aria-expanded', 'false');
+        console.log('Created dropdown button:', dropdownButton);
+        
+        const dropdownContent = document.createElement('div');
+        dropdownContent.className = 'references-dropdown';
+        dropdownContent.style.display = 'none';
+        
+        // Create reference items
+        references.forEach((ref, index) => {
+            const refItem = document.createElement('div');
+            refItem.className = 'reference-item';
+            
+            const refHeader = document.createElement('div');
+            refHeader.className = 'reference-header';
+            refHeader.textContent = `[${ref.reference}]`;
+            
+            const refText = document.createElement('div');
+            refText.className = 'reference-text';
+            refText.textContent = ref.chunk;
+            
+            refItem.appendChild(refHeader);
+            refItem.appendChild(refText);
+            dropdownContent.appendChild(refItem);
+        });
+        
+        // Toggle dropdown on click
+        dropdownButton.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const isExpanded = dropdownButton.getAttribute('aria-expanded') === 'true';
+            dropdownContent.style.display = isExpanded ? 'none' : 'block';
+            dropdownButton.setAttribute('aria-expanded', !isExpanded);
+        });
+        
+        // Close dropdown when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!container.contains(e.target)) {
+                dropdownContent.style.display = 'none';
+                dropdownButton.setAttribute('aria-expanded', 'false');
+            }
+        });
+        
+        container.appendChild(dropdownButton);
+        container.appendChild(dropdownContent);
+        
+        return container;
     }
     
     formatMessage(text) {

@@ -7,6 +7,7 @@ import os
 import asyncio
 import uuid
 import logging
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
@@ -91,6 +92,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+    references: List[Dict[str, Any]]
 
 
 class PendingFactsResponse(BaseModel):
@@ -315,10 +317,14 @@ async def chat(request: ChatRequest):
         # Number the chunks and format context with reference numbers
         numbered_context_parts = []
         reference_list = []
+        ref_num_to_chunk = {}  # Map reference number to full chunk text
         
         for ref_num, chunk in enumerate(context_chunks_with_refs, start=1):
             # Format chunk with reference number
-            numbered_context_parts.append(f"[Reference {ref_num}]\n{chunk['text']}")
+            numbered_context_parts.append(f"[{ref_num}] {chunk['text']}")
+            
+            # Store mapping from reference number to chunk text
+            ref_num_to_chunk[ref_num] = chunk['text']
             
             # Create reference entry (use first 100 chars of text as description)
             ref_text = chunk['text'].strip()
@@ -414,15 +420,14 @@ Instructions:
 - If the user asks in another language, still respond in English (as the assistant)
 
 IMPORTANT - CITATION REQUIREMENTS:
-- The context chunks are numbered sequentially as [Reference 1], [Reference 2], [Reference 3], etc. in the order they appear
+- The context chunks are numbered sequentially as [1], [2], [3], etc. in the order they appear
 - You MUST use ONLY these sequential reference numbers (1, 2, 3, 4, ...) - do NOT use any other numbers
 - You MUST include superscript reference numbers throughout your response wherever you use information from the context
 - Use superscript numbers (¹, ², ³, etc.) immediately after sentences or phrases that use information from the corresponding reference
 - The superscript number MUST match the sequential reference number (Reference 1 = ¹, Reference 2 = ², Reference 3 = ³, etc.)
 - You can use multiple references in the same sentence if needed (e.g., "Shepard was a Spectre¹ and fought the Reapers²")
-- At the end of your response, you MUST include a "References:" section listing ONLY the references you actually used, numbered sequentially (1, 2, 3, etc.), with the first 100 characters of each reference text
-- Do NOT include references you did not use in your answer
-- The reference numbers in your "References:" section must match the superscript numbers you used in your answer
+- At the end of your response, you MUST include a list of reference numbers you used, formatted as a Python-style list: [1, 4, 8] (for example, if you used references 1, 4, and 8)
+- Do NOT include a "References:" section - only include the list of numbers at the end
 
 {ref_instructions}
 """
@@ -436,34 +441,58 @@ IMPORTANT - CITATION REQUIREMENTS:
         )
         logger.info(f"[CHAT] Step 5: Generated answer (length: {len(answer)} chars)")
         
-        # Step 5.5: Ensure references section is present at the end
-        # Check if references section already exists
+        # Step 5.5: Extract reference list from answer and build JSON array
         answer_lower = answer.lower()
-        if "references:" not in answer_lower:
-            # Detect which references were actually used by looking for superscripts in the answer
+        
+        # Remove any "References:" section if it exists
+        if "references:" in answer_lower:
+            # Find where "References:" section starts and remove everything from there
+            for i in range(len(answer)):
+                if answer[i:].lower().startswith("references:"):
+                    answer = answer[:i].rstrip()
+                    break
+        
+        # Extract reference list in format [1, 4, 8] from the answer
+        ref_list_pattern = r'\[(\d+(?:\s*,\s*\d+)*)\]'
+        ref_list_match = re.search(ref_list_pattern, answer)
+        
+        if ref_list_match:
+            # Extract the numbers from the list
+            ref_list_str = ref_list_match.group(1)  # Get the content inside brackets
+            # Parse the numbers (handle spaces around commas)
+            ref_numbers = [int(num.strip()) for num in ref_list_str.split(',')]
+            # Remove the list from the answer text
+            answer = re.sub(ref_list_pattern, '', answer).rstrip()
+        else:
+            # Fallback: detect which references were actually used by looking for superscripts
             used_ref_nums = set()
             for ref in reference_list:
                 # Check if the superscript appears in the answer
                 if ref['superscript'] in answer:
                     used_ref_nums.add(ref['num'])
             
-            # If we found used references, only list those; otherwise list all (fallback)
-            refs_to_list = [ref for ref in reference_list if ref['num'] in used_ref_nums] if used_ref_nums else reference_list
-            
-            # Append references section - keep original reference numbers to match superscripts
-            references_section = "\n\nReferences:\n"
-            for ref in sorted(refs_to_list, key=lambda x: x['num']):  # Sort by reference number
-                references_section += f"{ref['num']}. {ref['text']}\n"
-            answer = answer.rstrip() + references_section
-        # If references section already exists, trust the LLM's output
+            if used_ref_nums:
+                ref_numbers = sorted(list(used_ref_nums))
+            else:
+                # Last resort: use all references
+                ref_numbers = sorted([ref['num'] for ref in reference_list])
+        
+        # Build the references JSON array using the extracted reference numbers
+        references_json = []
+        for ref_num in ref_numbers:
+            if ref_num in ref_num_to_chunk:
+                references_json.append({
+                    "reference": ref_num,
+                    "chunk": ref_num_to_chunk[ref_num]
+                })
         
         # Step 6: Update conversation history
         conversation_history[session_id].append({"role": "user", "content": message})
         conversation_history[session_id].append({"role": "assistant", "content": answer})
         logger.info(f"[CHAT] Step 6: Updated conversation history (total messages: {len(conversation_history[session_id])})")
         
-        logger.info(f"[CHAT] Session: {session_id} | Response sent successfully")
-        return ChatResponse(response=answer)
+        logger.info(f"[CHAT] Session: {session_id} | Response sent successfully with {len(references_json)} references")
+        return ChatResponse(response=answer, references=references_json)
         
     except Exception as e:
         print(f"Error in chat endpoint: {e}")
