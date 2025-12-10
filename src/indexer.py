@@ -63,7 +63,8 @@ class Indexer:
                 "text": chunk_text,
                 "token_count": len(chunk_tokens),
                 "start_token": start_token,
-                "end_token": end_token
+                "end_token": end_token,
+                "source": "database.txt"  # Mark chunks from initial database
             })
             
             chunk_id += 1

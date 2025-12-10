@@ -249,7 +249,10 @@ Answer with only "true" or "false" (lowercase, no punctuation, no explanation).
                 new_facts.append(fact)
                 logger.info(f"[FACT-EXTRACTOR] Candidate {i} is NEW - added to final list. Fact: {fact[:100]}...")
             else:
-                logger.info(f"[FACT-EXTRACTOR] Candidate {i} is already in index - skipped. Fact: {fact[:100]}...")
+                # Fact is already in index - add to seen_hashes so we don't extract it again in this session
+                fact_hash = self._hash_fact(fact)
+                seen_fact_hashes.add(fact_hash)
+                logger.info(f"[FACT-EXTRACTOR] Candidate {i} is already in index - skipped and added to seen_hashes. Fact: {fact[:100]}...")
         
         logger.info(f"[FACT-EXTRACTOR] Fact processing complete: {len(new_facts)} new facts found out of {len(candidate_facts)} candidates")
         return new_facts

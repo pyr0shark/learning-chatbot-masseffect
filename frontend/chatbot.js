@@ -41,7 +41,11 @@ class Chatbot {
     
     autoResizeTextarea() {
         this.messageInput.style.height = 'auto';
-        this.messageInput.style.height = Math.min(this.messageInput.scrollHeight, 120) + 'px';
+        // Allow textarea to grow up to 300px, then show scrollbar
+        const maxHeight = 300;
+        const newHeight = Math.min(this.messageInput.scrollHeight, maxHeight);
+        this.messageInput.style.height = newHeight + 'px';
+        this.messageInput.style.overflowY = newHeight >= maxHeight ? 'auto' : 'hidden';
     }
     
     async sendMessage() {

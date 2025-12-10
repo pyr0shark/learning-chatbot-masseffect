@@ -113,6 +113,83 @@ class RAGSearch:
         with open(self.index_file, 'w', encoding='utf-8') as f:
             json.dump(index_data, f, indent=2, ensure_ascii=False)
     
+    def remove_chunk_by_text(self, text: str) -> bool:
+        """
+        Remove a chunk from the index by matching text.
+        Only removes chunks that were added via user approval, not from database.txt.
+        
+        Args:
+            text: Text of the chunk to remove
+            
+        Returns:
+            True if chunk was found and removed, False otherwise
+        """
+        # Find chunk by text (exact match) and check source
+        original_count = len(self.chunks)
+        removed = False
+        
+        for i, chunk in enumerate(self.chunks):
+            if chunk.get("text", "").strip() == text.strip():
+                # Only allow deletion of user-approved chunks, not database.txt chunks
+                if chunk.get("source") == "user_approved":
+                    self.chunks.pop(i)
+                    removed = True
+                    break
+                else:
+                    # Chunk is from database.txt, cannot be deleted
+                    raise ValueError("Cannot delete chunks from database.txt. Only user-approved facts can be deleted.")
+        
+        if removed:
+            # Rebuild index
+            self.rebuild_index()
+            
+            # Update index.json file
+            with open(self.index_file, 'r', encoding='utf-8') as f:
+                index_data = json.load(f)
+            
+            index_data["chunks"] = self.chunks
+            index_data["metadata"]["total_chunks"] = len(self.chunks)
+            
+            with open(self.index_file, 'w', encoding='utf-8') as f:
+                json.dump(index_data, f, indent=2, ensure_ascii=False)
+            
+            return True
+        return False
+    
+    def reset_to_database_only(self) -> int:
+        """
+        Remove all user_approved chunks from the index, keeping only database.txt chunks.
+        
+        Returns:
+            Number of chunks removed
+        """
+        original_count = len(self.chunks)
+        
+        # Filter out all user_approved chunks, keep only database.txt chunks
+        self.chunks = [chunk for chunk in self.chunks if chunk.get("source") == "database.txt"]
+        
+        removed_count = original_count - len(self.chunks)
+        
+        if removed_count > 0:
+            # Rebuild index
+            self.rebuild_index()
+            
+            # Update index.json file
+            with open(self.index_file, 'r', encoding='utf-8') as f:
+                index_data = json.load(f)
+            
+            index_data["chunks"] = self.chunks
+            index_data["metadata"]["total_chunks"] = len(self.chunks)
+            
+            # Recalculate total tokens (only database.txt chunks)
+            total_tokens = sum(chunk.get("token_count", 0) for chunk in self.chunks)
+            index_data["metadata"]["total_tokens"] = total_tokens
+            
+            with open(self.index_file, 'w', encoding='utf-8') as f:
+                json.dump(index_data, f, indent=2, ensure_ascii=False)
+        
+        return removed_count
+    
     async def generate_search_terms(
         self,
         user_question: str,

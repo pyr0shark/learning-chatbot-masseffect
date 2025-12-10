@@ -73,6 +73,16 @@ fact_event_queues: Dict[str, asyncio.Queue] = {}
 fact_discovery_queue: Optional[asyncio.Queue] = None
 
 
+# Helper function to convert numbers to superscript
+def number_to_superscript(num: int) -> str:
+    """Convert a number to superscript format."""
+    superscript_digits = {
+        '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+        '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'
+    }
+    return ''.join(superscript_digits.get(digit, digit) for digit in str(num))
+
+
 # Pydantic models
 class ChatRequest(BaseModel):
     message: str
@@ -96,6 +106,10 @@ class ApproveFactRequest(BaseModel):
 class RejectFactRequest(BaseModel):
     session_id: str
     fact_id: str
+
+
+class DeleteFactRequest(BaseModel):
+    fact_text: str
 
 
 class AllFactsResponse(BaseModel):
@@ -153,19 +167,33 @@ async def process_facts_for_session(session_id: str):
         # Get session data
         history = conversation_history.get(session_id, [])
         used_results = used_search_results.get(session_id, [])
-        seen_hashes = seen_fact_hashes.get(session_id, set())
         
-        logger.info(f"[FACT-DISCOVERY] Session data - History: {len(history)} messages, Used results: {len(used_results)} chunks, Seen hashes: {len(seen_hashes)}")
+        # Initialize seen_hashes for this session if it doesn't exist
+        if session_id not in seen_fact_hashes:
+            seen_fact_hashes[session_id] = set()
+        seen_hashes = seen_fact_hashes[session_id]
+        
+        # Add hashes of all facts identified in this session to seen_hashes
+        # This includes: pending facts, previously extracted facts, and facts that were already in the index
+        pending_facts_list = pending_facts.get(session_id, [])
+        prev_extracted = previously_extracted_facts.get(session_id, [])
+        
+        # Add all facts from this session to seen_hashes
+        all_session_facts = [fact["fact"] for fact in pending_facts_list] + prev_extracted
+        for fact_text in all_session_facts:
+            fact_hash = fact_extractor._hash_fact(fact_text)
+            seen_hashes.add(fact_hash)
+        
+        logger.info(f"[FACT-DISCOVERY] Session data - History: {len(history)} messages, Used results: {len(used_results)} chunks, Seen hashes: {len(seen_hashes)} (including {len(all_session_facts)} facts from this session)")
         
         if not history or not used_results:
             logger.info(f"[FACT-DISCOVERY] Skipping - insufficient data (history: {len(history)}, used_results: {len(used_results)})")
             return
         
-        # Get previously extracted facts for this session
+        # Get previously extracted facts for this session (for the extract_candidate_facts prompt)
         prev_extracted = previously_extracted_facts.get(session_id, [])
         
         # Also include all facts from pending_facts (approved, rejected, or pending) to avoid re-extraction
-        pending_facts_list = pending_facts.get(session_id, [])
         pending_fact_texts = [fact["fact"] for fact in pending_facts_list]
         prev_extracted = list(set(prev_extracted + pending_fact_texts))  # Combine and deduplicate
         
@@ -269,11 +297,46 @@ async def chat(request: ChatRequest):
         unique_chunk_ids = {chunk["chunk_id"] for chunk in search_results}
         logger.info(f"[CHAT] Step 2: Unique chunks found: {len(unique_chunk_ids)} chunks (IDs: {sorted(list(unique_chunk_ids))[:10]}...)")
         
-        # Step 3: Get all context chunks (no token limit)
+        # Step 3: Get all context chunks (no token limit) and prepare for references
         logger.info(f"[CHAT] Step 3: Getting all context chunks (no token limit)")
-        context_chunks = rag_search.get_chunk_texts(search_results, max_tokens=999999999)
-        context_text = "\n\n".join(context_chunks)
-        logger.info(f"[CHAT] Step 3: Selected {len(context_chunks)} context chunks for answer generation")
+        import tiktoken
+        encoding = tiktoken.get_encoding("cl100k_base")
+        
+        # Get chunks with their full metadata for references
+        context_chunks_with_refs = []
+        total_tokens = 0
+        for chunk in search_results:
+            chunk_tokens = len(encoding.encode(chunk["text"]))
+            if total_tokens + chunk_tokens > 999999999:  # Same limit as before
+                break
+            context_chunks_with_refs.append(chunk)
+            total_tokens += chunk_tokens
+        
+        # Number the chunks and format context with reference numbers
+        numbered_context_parts = []
+        reference_list = []
+        
+        for ref_num, chunk in enumerate(context_chunks_with_refs, start=1):
+            # Format chunk with reference number
+            numbered_context_parts.append(f"[Reference {ref_num}]\n{chunk['text']}")
+            
+            # Create reference entry (use first 100 chars of text as description)
+            ref_text = chunk['text'].strip()
+            ref_preview = ref_text[:100] + "..." if len(ref_text) > 100 else ref_text
+            reference_list.append({
+                "num": ref_num,
+                "text": ref_preview,
+                "superscript": number_to_superscript(ref_num)
+            })
+        
+        # Add a clear header explaining the sequential numbering
+        context_header = f"IMPORTANT: The following {len(context_chunks_with_refs)} context chunks are numbered SEQUENTIALLY from 1 to {len(context_chunks_with_refs)}. Use ONLY these sequential numbers (1, 2, 3, ..., {len(context_chunks_with_refs)}) as reference numbers. Do NOT use any other numbers.\n\n"
+        context_text = context_header + "\n\n".join(numbered_context_parts)
+        logger.info(f"[CHAT] Step 3: Selected {len(context_chunks_with_refs)} context chunks for answer generation (numbered 1-{len(context_chunks_with_refs)})")
+        ref_mapping_str = ', '.join([f'Ref {ref["num"]}->{ref["superscript"]}' for ref in reference_list[:10]])
+        if len(reference_list) > 10:
+            ref_mapping_str += '...'
+        logger.info(f"[CHAT] Step 3: Reference mapping: {ref_mapping_str}")
         
         # Step 4: Update used search results (deduplicate by chunk_id)
         existing_chunk_ids = {chunk["chunk_id"] for chunk in used_search_results[session_id]}
@@ -307,6 +370,27 @@ async def chat(request: ChatRequest):
         
         history_section = f"RECENT CONVERSATION HISTORY:\n{history_text}" if history_text else ""
         
+        # Create instructions for superscript references
+        if len(reference_list) <= 20:
+            # Show all references if 20 or fewer
+            ref_instructions = "\n".join([
+                f"- Reference {ref['num']} → use superscript {ref['superscript']}"
+                for ref in reference_list
+            ])
+        else:
+            # Show first 10 and last 10 if more than 20
+            ref_instructions = "\n".join([
+                f"- Reference {ref['num']} → use superscript {ref['superscript']}"
+                for ref in reference_list[:10]
+            ])
+            ref_instructions += f"\n- ... (references 11 through {len(reference_list) - 10} follow the same pattern) ..."
+            ref_instructions += "\n" + "\n".join([
+                f"- Reference {ref['num']} → use superscript {ref['superscript']}"
+                for ref in reference_list[-10:]
+            ])
+        
+        ref_instructions = "Reference Number Mapping:\n" + ref_instructions + "\n\nRemember: Use ONLY these sequential reference numbers. Do NOT use any other numbers."
+        
         prompt = f"""You are a helpful Mass Effect lore assistant. Answer questions about the Mass Effect universe using the provided context and conversation history.
 
 USER QUESTION: {message}
@@ -328,6 +412,19 @@ Instructions:
 - Reference specific characters, events, or locations when relevant (only if they appear in the context)
 - Keep answers clear, well-structured, and complete
 - If the user asks in another language, still respond in English (as the assistant)
+
+IMPORTANT - CITATION REQUIREMENTS:
+- The context chunks are numbered sequentially as [Reference 1], [Reference 2], [Reference 3], etc. in the order they appear
+- You MUST use ONLY these sequential reference numbers (1, 2, 3, 4, ...) - do NOT use any other numbers
+- You MUST include superscript reference numbers throughout your response wherever you use information from the context
+- Use superscript numbers (¹, ², ³, etc.) immediately after sentences or phrases that use information from the corresponding reference
+- The superscript number MUST match the sequential reference number (Reference 1 = ¹, Reference 2 = ², Reference 3 = ³, etc.)
+- You can use multiple references in the same sentence if needed (e.g., "Shepard was a Spectre¹ and fought the Reapers²")
+- At the end of your response, you MUST include a "References:" section listing ONLY the references you actually used, numbered sequentially (1, 2, 3, etc.), with the first 100 characters of each reference text
+- Do NOT include references you did not use in your answer
+- The reference numbers in your "References:" section must match the superscript numbers you used in your answer
+
+{ref_instructions}
 """
         
         logger.info(f"[CHAT] Step 5: Generating answer with model azure.gpt-5-mini")
@@ -339,10 +436,29 @@ Instructions:
         )
         logger.info(f"[CHAT] Step 5: Generated answer (length: {len(answer)} chars)")
         
+        # Step 5.5: Ensure references section is present at the end
+        # Check if references section already exists
+        answer_lower = answer.lower()
+        if "references:" not in answer_lower:
+            # Detect which references were actually used by looking for superscripts in the answer
+            used_ref_nums = set()
+            for ref in reference_list:
+                # Check if the superscript appears in the answer
+                if ref['superscript'] in answer:
+                    used_ref_nums.add(ref['num'])
+            
+            # If we found used references, only list those; otherwise list all (fallback)
+            refs_to_list = [ref for ref in reference_list if ref['num'] in used_ref_nums] if used_ref_nums else reference_list
+            
+            # Append references section - keep original reference numbers to match superscripts
+            references_section = "\n\nReferences:\n"
+            for ref in sorted(refs_to_list, key=lambda x: x['num']):  # Sort by reference number
+                references_section += f"{ref['num']}. {ref['text']}\n"
+            answer = answer.rstrip() + references_section
+        # If references section already exists, trust the LLM's output
+        
         # Step 6: Update conversation history
         conversation_history[session_id].append({"role": "user", "content": message})
-        conversation_history[session_id].append({"role": "assistant", "content": answer})
-        # Step 6: Update conversation history with assistant response
         conversation_history[session_id].append({"role": "assistant", "content": answer})
         logger.info(f"[CHAT] Step 6: Updated conversation history (total messages: {len(conversation_history[session_id])})")
         
@@ -462,7 +578,11 @@ async def approve_fact(request: ApproveFactRequest):
             "token_count": token_count,
             "start_token": 0,
             "end_token": token_count,
-            "embedding": embeddings[0]
+            "embedding": embeddings[0],
+            "source": "user_approved",  # Mark chunks added via user approval
+            "created_at": fact.get("created_at", datetime.utcnow().isoformat()),  # Use original creation time if available
+            "approved_at": datetime.utcnow().isoformat(),
+            "session_id": request.session_id
         }
         
         # Add to index
@@ -499,30 +619,131 @@ async def reject_fact(request: RejectFactRequest):
     return {"status": "success", "message": "Fact rejected"}
 
 
+# Delete fact from index
+@app.post("/api/facts/delete")
+async def delete_fact(request: DeleteFactRequest):
+    """Delete a fact from the index."""
+    global rag_search
+    
+    if not rag_search:
+        raise HTTPException(status_code=500, detail="RAG search not initialized")
+    
+    try:
+        # Remove from index
+        removed = rag_search.remove_chunk_by_text(request.fact_text)
+        
+        if not removed:
+            raise HTTPException(status_code=404, detail="Fact not found in index")
+        
+        # Also update status in pending_facts if it exists
+        for session_id, facts in pending_facts.items():
+            for fact in facts:
+                if fact.get("fact") == request.fact_text and fact.get("status") == "approved":
+                    fact["status"] = "deleted"
+                    fact["deleted_at"] = datetime.utcnow().isoformat()
+                    break
+        
+        return {"status": "success", "message": "Fact deleted from index"}
+        
+    except ValueError as e:
+        # ValueError is raised when trying to delete database.txt chunks
+        logger.warning(f"Cannot delete fact: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error deleting fact: {e}")
+        raise HTTPException(status_code=500, detail=f"Error deleting fact: {str(e)}")
+
+
+# Reset index to database.txt only
+@app.post("/api/index/reset")
+async def reset_index():
+    """Reset the index to only contain database.txt chunks, removing all user-approved facts."""
+    global rag_search
+    
+    if not rag_search:
+        raise HTTPException(status_code=500, detail="RAG search not initialized")
+    
+    try:
+        # Remove all user_approved chunks
+        removed_count = rag_search.reset_to_database_only()
+        
+        # Also mark all approved facts in pending_facts as deleted
+        deleted_facts = 0
+        for session_id, facts in pending_facts.items():
+            for fact in facts:
+                if fact.get("status") == "approved":
+                    fact["status"] = "deleted"
+                    fact["deleted_at"] = datetime.utcnow().isoformat()
+                    deleted_facts += 1
+        
+        logger.info(f"[INDEX-RESET] Removed {removed_count} chunks from index, marked {deleted_facts} facts as deleted")
+        
+        return {
+            "status": "success",
+            "message": f"Index reset successfully. Removed {removed_count} user-approved chunks.",
+            "chunks_removed": removed_count,
+            "facts_marked_deleted": deleted_facts,
+            "remaining_chunks": len(rag_search.chunks)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error resetting index: {e}")
+        raise HTTPException(status_code=500, detail=f"Error resetting index: {str(e)}")
+
+
 # Get all facts (approved and rejected)
 @app.get("/api/facts/all", response_model=AllFactsResponse)
 async def get_all_facts():
-    """Get all approved and rejected facts from all sessions."""
+    """Get all approved and rejected facts from all sessions and from the index."""
+    global rag_search
+    
     approved_facts = []
     rejected_facts = []
+    seen_approved_texts = set()  # To deduplicate
     
-    # Collect all facts from all sessions
+    # First, collect all approved facts from the index (user_approved chunks)
+    if rag_search:
+        for chunk in rag_search.chunks:
+            if chunk.get("source") == "user_approved":
+                fact_text = chunk.get("text", "").strip()
+                if fact_text and fact_text not in seen_approved_texts:
+                    approved_facts.append({
+                        "fact_id": f"index_{chunk.get('chunk_id')}",
+                        "fact": fact_text,
+                        "status": "approved",
+                        "approved_at": chunk.get("approved_at", chunk.get("created_at", "")),
+                        "created_at": chunk.get("created_at", chunk.get("approved_at", "")),
+                        "session_id": chunk.get("session_id", "unknown"),
+                        "source": "index"
+                    })
+                    seen_approved_texts.add(fact_text)
+    
+    # Then, collect all facts from pending_facts (in-memory session facts)
     for session_id, facts in pending_facts.items():
         for fact in facts:
+            fact_text = fact.get("fact", "").strip()
+            
             if fact.get("status") == "approved":
-                approved_facts.append({
-                    **fact,
-                    "session_id": session_id
-                })
+                # Only add if not already in index (deduplicate)
+                if fact_text not in seen_approved_texts:
+                    approved_facts.append({
+                        **fact,
+                        "session_id": session_id,
+                        "source": "session"
+                    })
+                    seen_approved_texts.add(fact_text)
             elif fact.get("status") == "rejected":
                 rejected_facts.append({
                     **fact,
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "source": "session"
                 })
     
     # Sort by date (most recent first)
-    approved_facts.sort(key=lambda x: x.get("approved_at", ""), reverse=True)
-    rejected_facts.sort(key=lambda x: x.get("rejected_at", ""), reverse=True)
+    approved_facts.sort(key=lambda x: x.get("approved_at", x.get("created_at", "")), reverse=True)
+    rejected_facts.sort(key=lambda x: x.get("rejected_at", x.get("created_at", "")), reverse=True)
+    
+    logger.info(f"[FACTS-API] Returning {len(approved_facts)} approved facts ({len([f for f in approved_facts if f.get('source') == 'index'])} from index, {len([f for f in approved_facts if f.get('source') == 'session'])} from sessions) and {len(rejected_facts)} rejected facts")
     
     return AllFactsResponse(approved=approved_facts, rejected=rejected_facts)
 

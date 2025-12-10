@@ -5,6 +5,7 @@ class FactsPage {
         this.rejectedContainer = document.getElementById('rejected-facts');
         this.approvedCount = document.getElementById('approved-count');
         this.rejectedCount = document.getElementById('rejected-count');
+        this.resetBtn = document.getElementById('reset-index-btn');
         
         // Load facts when page becomes active
         this.init();
@@ -15,6 +16,11 @@ class FactsPage {
         const factsPage = document.getElementById('facts-page');
         if (factsPage && factsPage.classList.contains('active')) {
             this.loadFacts();
+        }
+        
+        // Set up reset button
+        if (this.resetBtn) {
+            this.resetBtn.addEventListener('click', () => this.resetIndex());
         }
         
         // Listen for page changes via hash changes (router navigation)
@@ -77,17 +83,45 @@ class FactsPage {
         } else {
             this.rejectedContainer.innerHTML = rejected.map(fact => this.renderFactCard(fact, 'rejected')).join('');
         }
+        
+        // Attach delete button listeners
+        this.attachDeleteListeners();
     }
     
     renderFactCard(fact, status) {
-        const date = fact.approved_at || fact.rejected_at || fact.created_at;
-        const dateStr = date ? new Date(date).toLocaleString() : 'Unknown date';
+        // Format timestamps
+        let dateStr = 'Unknown date';
+        let dateLabel = '';
+        
+        if (status === 'approved' && fact.approved_at) {
+            dateStr = new Date(fact.approved_at).toLocaleString();
+            dateLabel = 'Approved: ';
+        } else if (status === 'rejected' && fact.rejected_at) {
+            dateStr = new Date(fact.rejected_at).toLocaleString();
+            dateLabel = 'Rejected: ';
+        } else if (fact.created_at) {
+            dateStr = new Date(fact.created_at).toLocaleString();
+            dateLabel = 'Created: ';
+        }
+        
+        // Show source info (optional, for debugging)
+        const sourceInfo = fact.source === 'index' ? ' (from index)' : '';
+        
+        // Delete button (only for approved facts that are user_approved, not database.txt)
+        // Only show delete button if source is 'index' or 'session' (user-approved facts)
+        const escapedFact = this.escapeAttribute(fact.fact);
+        const deleteButton = (status === 'approved' && fact.source !== 'database.txt')
+            ? `<button class="fact-delete-btn" data-fact-text="${escapedFact}" title="Delete from index">✕</button>`
+            : '';
         
         return `
-            <div class="fact-card ${status}">
+            <div class="fact-card ${status}" data-fact-text="${escapedFact}">
                 <div class="fact-card-header">
-                    <span class="fact-status-badge ${status}">${status === 'approved' ? '✅ Approved' : '❌ Rejected'}</span>
-                    <span class="fact-date">${dateStr}</span>
+                    <div class="fact-header-left">
+                        <span class="fact-status-badge ${status}">${status === 'approved' ? '✅ Approved' : '❌ Rejected'}</span>
+                        <span class="fact-date">${dateLabel}${dateStr}${sourceInfo}</span>
+                    </div>
+                    ${deleteButton}
                 </div>
                 <div class="fact-card-content">
                     <p>${this.escapeHtml(fact.fact)}</p>
@@ -96,15 +130,119 @@ class FactsPage {
         `;
     }
     
+    attachDeleteListeners() {
+        // Attach event listeners to delete buttons
+        document.querySelectorAll('.fact-delete-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const factText = e.target.getAttribute('data-fact-text');
+                this.deleteFact(factText);
+            });
+        });
+    }
+    
+    async deleteFact(factText) {
+        if (!confirm('Are you sure you want to delete this fact from the index? This action cannot be undone.')) {
+            return;
+        }
+        
+        try {
+            const response = await fetch('/api/facts/delete', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    fact_text: factText
+                })
+            });
+            
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'Failed to delete fact');
+            }
+            
+            // Remove the fact card from the UI
+            const factCard = document.querySelector(`[data-fact-text="${this.escapeHtml(factText)}"]`);
+            if (factCard) {
+                factCard.style.opacity = '0';
+                factCard.style.transform = 'translateX(-20px)';
+                setTimeout(() => {
+                    factCard.remove();
+                    // Reload facts to update counts
+                    this.loadFacts();
+                }, 300);
+            } else {
+                // If card not found, just reload
+                this.loadFacts();
+            }
+        } catch (error) {
+            console.error('Error deleting fact:', error);
+            alert('Error deleting fact: ' + error.message);
+        }
+    }
+    
     escapeHtml(text) {
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
     }
+    
+    escapeAttribute(text) {
+        // Escape for HTML attributes (quotes, etc.)
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+    
+    async resetIndex() {
+        if (!confirm('Are you sure you want to reset the index? This will remove all user-approved facts from the index, keeping only the original database.txt content. This action cannot be undone.')) {
+            return;
+        }
+        
+        if (this.resetBtn) {
+            this.resetBtn.disabled = true;
+            this.resetBtn.style.opacity = '0.6';
+        }
+        
+        try {
+            const response = await fetch('/api/index/reset', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            });
+            
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || 'Failed to reset index');
+            }
+            
+            const data = await response.json();
+            
+            // Show success message
+            alert(`Index reset successfully!\n\nRemoved ${data.chunks_removed} user-approved chunks.\nRemaining chunks: ${data.remaining_chunks}`);
+            
+            // Reload facts to reflect the changes
+            this.loadFacts();
+            
+        } catch (error) {
+            console.error('Error resetting index:', error);
+            alert('Error resetting index: ' + error.message);
+        } finally {
+            if (this.resetBtn) {
+                this.resetBtn.disabled = false;
+                this.resetBtn.style.opacity = '1';
+            }
+        }
+    }
 }
 
 // Initialize facts page when DOM is loaded
+let factsPage;
 document.addEventListener('DOMContentLoaded', () => {
-    new FactsPage();
+    factsPage = new FactsPage();
 });
 
