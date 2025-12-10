@@ -193,7 +193,8 @@ class RAGSearch:
     async def generate_search_terms(
         self,
         user_question: str,
-        conversation_history: List[Dict[str, str]] = None
+        conversation_history: List[Dict[str, str]] = None,
+        num_terms: int = 5
     ) -> List[str]:
         """
         Generate search terms from user question using GPT-5-mini.
@@ -201,9 +202,10 @@ class RAGSearch:
         Args:
             user_question: User's question
             conversation_history: Recent conversation history
+            num_terms: Number of search terms to generate (default: 5)
             
         Returns:
-            List of 3-5 search terms
+            List of search terms (exactly num_terms)
         """
         # Build context from conversation history
         history_text = ""
@@ -222,9 +224,9 @@ User question: {user_question}
 
 {history_section}
 
-Generate 3-5 short, specific search terms that would help find relevant information in a Mass Effect lore database to answer this question. Each search term should be a key phrase or concept (1-4 words).
+Generate exactly {num_terms} short, specific search terms that would help find relevant information in a Mass Effect lore database to answer this question. Each search term should be a key phrase or concept (1-4 words).
 
-Output only the search terms, one per line, without numbering or bullets.
+Output only the search terms, one per line, without numbering or bullets. Generate exactly {num_terms} search terms.
 """
         
         logger.info(f"[RAG-SEARCH] Generating search terms for question: {user_question[:100]}...")
@@ -240,8 +242,8 @@ Output only the search terms, one per line, without numbering or bullets.
         # Parse search terms (one per line)
         terms = [line.strip() for line in response.strip().split('\n') if line.strip()]
         
-        # Limit to 5 terms
-        final_terms = terms[:5]
+        # Limit to num_terms
+        final_terms = terms[:num_terms]
         logger.info(f"[RAG-SEARCH] Generated {len(final_terms)} search terms: {final_terms}")
         return final_terms
     

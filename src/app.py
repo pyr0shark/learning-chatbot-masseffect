@@ -284,23 +284,51 @@ async def chat(request: ChatRequest):
     try:
         logger.info(f"[CHAT] Session: {session_id} | User message: {message[:100]}...")
         
-        # Step 1: Generate search terms
+        # Get conversation history (needed for answer generation later)
         history = conversation_history.get(session_id, [])
-        logger.info(f"[CHAT] Step 1: Generating search terms (history length: {len(history)})")
-        search_terms = await rag_search.generate_search_terms(message, history)
-        logger.info(f"[CHAT] Step 1: Generated {len(search_terms)} search terms: {search_terms}")
         
-        # Step 2: Vector search for each term
-        logger.info(f"[CHAT] Step 2: Performing vector search for {len(search_terms)} terms")
-        search_results = await rag_search.search_multiple_terms(search_terms, k_per_term=10)
-        logger.info(f"[CHAT] Step 2: Found {len(search_results)} total search results")
+        # Step 1: Calculate number of searches based on character count
+        char_count = len(message)
+        num_searches = round(char_count / 200)
+        # Ensure at least 1 search
+        num_searches = max(1, num_searches)
+        logger.info(f"[CHAT] Step 1: Character count: {char_count}, number of searches: {num_searches}")
+        
+        # Step 2: Generate exactly that many search terms
+        logger.info(f"[CHAT] Step 2: Generating {num_searches} search terms (history length: {len(history)})")
+        search_terms = await rag_search.generate_search_terms(message, history, num_terms=num_searches)
+        logger.info(f"[CHAT] Step 2: Generated {len(search_terms)} search terms: {search_terms}")
+        
+        # Step 3: Perform parallel vector searches - each search term used exactly once
+        logger.info(f"[CHAT] Step 3: Performing {len(search_terms)} parallel vector searches (one per search term)")
+        search_tasks = []
+        for search_term in search_terms:
+            search_tasks.append(rag_search.vector_search(search_term, k=10))
+        
+        # Run all searches in parallel
+        search_results_lists = await asyncio.gather(*search_tasks)
+        
+        # Merge and deduplicate results
+        all_results = []
+        seen_chunk_ids = set()
+        for results_list in search_results_lists:
+            for chunk in results_list:
+                chunk_id = chunk["chunk_id"]
+                if chunk_id not in seen_chunk_ids:
+                    seen_chunk_ids.add(chunk_id)
+                    all_results.append(chunk)
+        
+        # Sort by similarity
+        all_results.sort(key=lambda x: x["similarity"], reverse=True)
+        search_results = all_results
+        logger.info(f"[CHAT] Step 3: Found {len(search_results)} unique search results from {num_searches} parallel searches")
         
         # Log unique chunk IDs found
         unique_chunk_ids = {chunk["chunk_id"] for chunk in search_results}
-        logger.info(f"[CHAT] Step 2: Unique chunks found: {len(unique_chunk_ids)} chunks (IDs: {sorted(list(unique_chunk_ids))[:10]}...)")
+        logger.info(f"[CHAT] Step 3: Unique chunks found: {len(unique_chunk_ids)} chunks (IDs: {sorted(list(unique_chunk_ids))[:10]}...)")
         
-        # Step 3: Get all context chunks (no token limit) and prepare for references
-        logger.info(f"[CHAT] Step 3: Getting all context chunks (no token limit)")
+        # Step 4: Get all context chunks (no token limit) and prepare for references
+        logger.info(f"[CHAT] Step 4: Getting all context chunks (no token limit)")
         import tiktoken
         encoding = tiktoken.get_encoding("cl100k_base")
         
@@ -338,13 +366,13 @@ async def chat(request: ChatRequest):
         # Add a clear header explaining the sequential numbering
         context_header = f"IMPORTANT: The following {len(context_chunks_with_refs)} context chunks are numbered SEQUENTIALLY from 1 to {len(context_chunks_with_refs)}. Use ONLY these sequential numbers (1, 2, 3, ..., {len(context_chunks_with_refs)}) as reference numbers. Do NOT use any other numbers.\n\n"
         context_text = context_header + "\n\n".join(numbered_context_parts)
-        logger.info(f"[CHAT] Step 3: Selected {len(context_chunks_with_refs)} context chunks for answer generation (numbered 1-{len(context_chunks_with_refs)})")
+        logger.info(f"[CHAT] Step 4: Selected {len(context_chunks_with_refs)} context chunks for answer generation (numbered 1-{len(context_chunks_with_refs)})")
         ref_mapping_str = ', '.join([f'Ref {ref["num"]}->{ref["superscript"]}' for ref in reference_list[:10]])
         if len(reference_list) > 10:
             ref_mapping_str += '...'
-        logger.info(f"[CHAT] Step 3: Reference mapping: {ref_mapping_str}")
+        logger.info(f"[CHAT] Step 4: Reference mapping: {ref_mapping_str}")
         
-        # Step 4: Update used search results (deduplicate by chunk_id)
+        # Step 5: Update used search results (deduplicate by chunk_id)
         existing_chunk_ids = {chunk["chunk_id"] for chunk in used_search_results[session_id]}
         new_chunks_count = 0
         for chunk in search_results:
@@ -441,7 +469,7 @@ IMPORTANT - CITATION REQUIREMENTS:
         )
         logger.info(f"[CHAT] Step 5: Generated answer (length: {len(answer)} chars)")
         
-        # Step 5.5: Extract reference list from answer and build JSON array
+        # Step 5.5: Extract reference list from answer, renumber chronologically, and build JSON array
         answer_lower = answer.lower()
         
         # Remove any "References:" section if it exists
@@ -456,34 +484,73 @@ IMPORTANT - CITATION REQUIREMENTS:
         ref_list_pattern = r'\[(\d+(?:\s*,\s*\d+)*)\]'
         ref_list_match = re.search(ref_list_pattern, answer)
         
-        if ref_list_match:
+        # Find all superscripts in the answer in chronological order
+        used_ref_nums_ordered = []
+        seen_refs = set()
+        
+        # Create a mapping from superscript to original reference number
+        superscript_to_ref_num = {ref['superscript']: ref['num'] for ref in reference_list}
+        
+        # Find all superscripts in chronological order (by position in text)
+        # Sort superscripts by length (longer first) to avoid partial matches
+        sorted_superscripts = sorted(superscript_to_ref_num.items(), key=lambda x: len(x[0]), reverse=True)
+        
+        i = 0
+        while i < len(answer):
+            matched = False
+            for superscript, orig_ref_num in sorted_superscripts:
+                if answer[i:i+len(superscript)] == superscript:
+                    if orig_ref_num not in seen_refs:
+                        used_ref_nums_ordered.append(orig_ref_num)
+                        seen_refs.add(orig_ref_num)
+                    i += len(superscript)  # Skip past this superscript
+                    matched = True
+                    break
+            if not matched:
+                i += 1
+        
+        # If we found references from superscripts, use those; otherwise try to extract from list
+        if used_ref_nums_ordered:
+            ref_numbers_ordered = used_ref_nums_ordered
+        elif ref_list_match:
             # Extract the numbers from the list
-            ref_list_str = ref_list_match.group(1)  # Get the content inside brackets
-            # Parse the numbers (handle spaces around commas)
-            ref_numbers = [int(num.strip()) for num in ref_list_str.split(',')]
-            # Remove the list from the answer text
-            answer = re.sub(ref_list_pattern, '', answer).rstrip()
+            ref_list_str = ref_list_match.group(1)
+            ref_numbers_ordered = [int(num.strip()) for num in ref_list_str.split(',')]
         else:
-            # Fallback: detect which references were actually used by looking for superscripts
+            # Fallback: detect which references were actually used by looking for superscripts (unordered)
             used_ref_nums = set()
             for ref in reference_list:
-                # Check if the superscript appears in the answer
                 if ref['superscript'] in answer:
                     used_ref_nums.add(ref['num'])
             
             if used_ref_nums:
-                ref_numbers = sorted(list(used_ref_nums))
+                ref_numbers_ordered = sorted(list(used_ref_nums))
             else:
                 # Last resort: use all references
-                ref_numbers = sorted([ref['num'] for ref in reference_list])
+                ref_numbers_ordered = sorted([ref['num'] for ref in reference_list])
         
-        # Build the references JSON array using the extracted reference numbers
+        # Remove the reference list pattern from the answer (always remove it, regardless of how we got the refs)
+        answer = re.sub(ref_list_pattern, '', answer).rstrip()
+        
+        # Create mapping from old reference number to new sequential number (1, 2, 3, ...)
+        old_to_new_ref = {}
+        for new_num, old_ref_num in enumerate(ref_numbers_ordered, start=1):
+            old_to_new_ref[old_ref_num] = new_num
+        
+        # Replace all superscripts in the answer with new sequential numbers
+        for old_ref_num, new_ref_num in old_to_new_ref.items():
+            old_superscript = number_to_superscript(old_ref_num)
+            new_superscript = number_to_superscript(new_ref_num)
+            # Replace all occurrences of the old superscript with the new one
+            answer = answer.replace(old_superscript, new_superscript)
+        
+        # Build the references JSON array using the new sequential numbering
         references_json = []
-        for ref_num in ref_numbers:
-            if ref_num in ref_num_to_chunk:
+        for new_ref_num, old_ref_num in enumerate(ref_numbers_ordered, start=1):
+            if old_ref_num in ref_num_to_chunk:
                 references_json.append({
-                    "reference": ref_num,
-                    "chunk": ref_num_to_chunk[ref_num]
+                    "reference": new_ref_num,
+                    "chunk": ref_num_to_chunk[old_ref_num]
                 })
         
         # Step 6: Update conversation history
