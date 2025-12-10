@@ -287,20 +287,16 @@ async def chat(request: ChatRequest):
         # Get conversation history (needed for answer generation later)
         history = conversation_history.get(session_id, [])
         
-        # Step 1: Calculate number of searches based on character count
-        char_count = len(message)
-        num_searches = round(char_count / 200)
-        # Ensure at least 1 search
-        num_searches = max(1, num_searches)
-        logger.info(f"[CHAT] Step 1: Character count: {char_count}, number of searches: {num_searches}")
+        # Step 1: Split user question on punctuation to get search terms
+        import re
+        # Split on: , ; : - . ! ? ( " | )
+        search_terms_raw = re.split(r'[,;:\-\.!?\(\)"|]', message)
+        # Clean up: strip whitespace and filter out empty strings
+        search_terms = [term.strip() for term in search_terms_raw if term.strip()]
+        logger.info(f"[CHAT] Step 1: Split question into {len(search_terms)} search terms: {search_terms}")
         
-        # Step 2: Generate exactly that many search terms
-        logger.info(f"[CHAT] Step 2: Generating {num_searches} search terms (history length: {len(history)})")
-        search_terms = await rag_search.generate_search_terms(message, history, num_terms=num_searches)
-        logger.info(f"[CHAT] Step 2: Generated {len(search_terms)} search terms: {search_terms}")
-        
-        # Step 3: Perform parallel vector searches - each search term used exactly once
-        logger.info(f"[CHAT] Step 3: Performing {len(search_terms)} parallel vector searches (one per search term)")
+        # Step 2: Perform parallel vector searches - each search term used exactly once
+        logger.info(f"[CHAT] Step 2: Performing {len(search_terms)} parallel vector searches (one per search term)")
         search_tasks = []
         for search_term in search_terms:
             search_tasks.append(rag_search.vector_search(search_term, k=10))
@@ -321,7 +317,7 @@ async def chat(request: ChatRequest):
         # Sort by similarity
         all_results.sort(key=lambda x: x["similarity"], reverse=True)
         search_results = all_results
-        logger.info(f"[CHAT] Step 3: Found {len(search_results)} unique search results from {num_searches} parallel searches")
+        logger.info(f"[CHAT] Step 2: Found {len(search_results)} unique search results from {len(search_terms)} parallel searches")
         
         # Log unique chunk IDs found
         unique_chunk_ids = {chunk["chunk_id"] for chunk in search_results}
@@ -405,22 +401,22 @@ async def chat(request: ChatRequest):
         history_section = f"RECENT CONVERSATION HISTORY:\n{history_text}" if history_text else ""
         
         # Create instructions for superscript references
-        if len(reference_list) <= 20:
-            # Show all references if 20 or fewer
+        if len(reference_list) <= 6:
+            # Show all references if 6 or fewer
             ref_instructions = "\n".join([
                 f"- Reference {ref['num']} → use superscript {ref['superscript']}"
                 for ref in reference_list
             ])
         else:
-            # Show first 10 and last 10 if more than 20
+            # Show first 3 and last 3 if more than 6
             ref_instructions = "\n".join([
                 f"- Reference {ref['num']} → use superscript {ref['superscript']}"
-                for ref in reference_list[:10]
+                for ref in reference_list[:3]
             ])
-            ref_instructions += f"\n- ... (references 11 through {len(reference_list) - 10} follow the same pattern) ..."
+            ref_instructions += f"\n- ... (references 4 through {len(reference_list) - 3} follow the same pattern) ..."
             ref_instructions += "\n" + "\n".join([
                 f"- Reference {ref['num']} → use superscript {ref['superscript']}"
-                for ref in reference_list[-10:]
+                for ref in reference_list[-3:]
             ])
         
         ref_instructions = "Reference Number Mapping:\n" + ref_instructions + "\n\nRemember: Use ONLY these sequential reference numbers. Do NOT use any other numbers."
